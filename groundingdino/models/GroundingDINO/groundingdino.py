@@ -235,25 +235,31 @@ class GroundingDINO(nn.Module):
         assert compact_feature.shape[2] == H_list[0]
         assert compact_feature.shape[3] == W_list[0]
 
-        return compact_feature, C_list, H_list, W_list
+        meta_info = {
+            "C_list": C_list,
+            "H_list": H_list,
+            "W_list": W_list,
+        }
 
-    def feature_forward(self, compact_feature, C_list, H_list, W_list, captions):
+        return compact_feature, meta_info
+
+    def feature_forward(self, compact_feature, meta_info, captions):
         device = compact_feature.device
         recovered_features = []
-        for i in range(len(C_list)):
+        for i in range(len(meta_info["C_list"])):
             if i == 0:
-                feature_tensor = compact_feature[:, :C_list[i], :, :]
-                mask = torch.zeros((feature_tensor.shape[0], H_list[i], W_list[i]), dtype=torch.bool, device=device)
+                feature_tensor = compact_feature[:, :meta_info["C_list"][i], :, :]
+                mask = torch.zeros((feature_tensor.shape[0], meta_info["H_list"][i], meta_info["W_list"][i]), dtype=torch.bool, device=device)
                 recovered_features.append(NestedTensor(feature_tensor, mask))
             else:
-                prv_c_dim = sum(C_list[:i])
+                prv_c_dim = sum(meta_info["C_list"][:i])
                 feature_tensor = interpolate(
-                        compact_feature[:, prv_c_dim:prv_c_dim + C_list[i], :, :],
-                        (H_list[i], W_list[i]),
+                        compact_feature[:, prv_c_dim:prv_c_dim + meta_info["C_list"][i], :, :],
+                        (meta_info["H_list"][i], meta_info["W_list"][i]),
                         mode="bilinear",
                         align_corners=False,
                     )
-                mask = torch.zeros((feature_tensor.shape[0], H_list[i], W_list[i]), dtype=torch.bool, device=device)
+                mask = torch.zeros((feature_tensor.shape[0], meta_info["H_list"][i], meta_info["W_list"][i]), dtype=torch.bool, device=device)
                 recovered_features.append(NestedTensor(feature_tensor, mask))
 
         # Compute poss
