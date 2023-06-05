@@ -47,6 +47,7 @@ from .bertwarper import (
 from .transformer import build_transformer
 from .utils import MLP, ContrastiveEmbed, sigmoid_focal_loss
 
+import pdb
 
 class GroundingDINO(nn.Module):
     """This is the Cross-Attention Detector module that performs object detection"""
@@ -208,8 +209,164 @@ class GroundingDINO(nn.Module):
 
     def init_ref_points(self, use_num_queries):
         self.refpoint_embed = nn.Embedding(use_num_queries, self.query_dim)
+    
+    def get_feature(self, samples: NestedTensor):
+        if isinstance(samples, (list, torch.Tensor)):
+            samples = nested_tensor_from_tensor_list(samples)
+        features, poss = self.backbone(samples)
 
-    def forward(self, samples: NestedTensor, targets: List = None, **kw):
+        # Concatenate features of different dimensions
+        # Interpolate all features to the first one
+        feature_list = [features[0].tensors]
+        feature_H, feature_W = features[0].tensors.shape[-2:]
+        for i in range(1, len(features)):
+            feature_list.append(
+                interpolate(features[i].tensors, (feature_H, feature_W), mode="bilinear", align_corners=False)
+            )
+        compact_feature = torch.cat(feature_list, dim=1)
+
+        C_list, H_list, W_list = [], [], []
+        for i in range(len(features)):
+            C_list.append(features[i].tensors.shape[1])
+            H_list.append(features[i].tensors.shape[2])
+            W_list.append(features[i].tensors.shape[3])
+
+        assert compact_feature.shape[1] == sum(C_list)
+        assert compact_feature.shape[2] == H_list[0]
+        assert compact_feature.shape[3] == W_list[0]
+
+        return compact_feature, C_list, H_list, W_list
+
+    def feature_forward(self, compact_feature, C_list, H_list, W_list, captions):
+        device = compact_feature.device
+        recovered_features = []
+        for i in range(len(C_list)):
+            if i == 0:
+                feature_tensor = compact_feature[:, :C_list[i], :, :]
+                mask = torch.zeros((feature_tensor.shape[0], H_list[i], W_list[i]), dtype=torch.bool, device=device)
+                recovered_features.append(NestedTensor(feature_tensor, mask))
+            else:
+                prv_c_dim = sum(C_list[:i])
+                feature_tensor = interpolate(
+                        compact_feature[:, prv_c_dim:prv_c_dim + C_list[i], :, :],
+                        (H_list[i], W_list[i]),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                mask = torch.zeros((feature_tensor.shape[0], H_list[i], W_list[i]), dtype=torch.bool, device=device)
+                recovered_features.append(NestedTensor(feature_tensor, mask))
+
+        # Compute poss
+        new_poss = []
+        for x in recovered_features:
+            new_poss.append(self.backbone[1](x).to(x.tensors.dtype))
+        
+        features, poss = recovered_features, new_poss
+
+        assert len(captions) == 1
+        assert captions[0].endswith(".")
+
+        # encoder texts
+        tokenized = self.tokenizer(captions, padding="longest", return_tensors="pt").to(
+            device
+        )
+        (
+            text_self_attention_masks,
+            position_ids,
+            cate_to_token_mask_list,
+        ) = generate_masks_with_special_tokens_and_transfer_map(
+            tokenized, self.specical_tokens, self.tokenizer
+        )
+
+        if text_self_attention_masks.shape[1] > self.max_text_len:
+            text_self_attention_masks = text_self_attention_masks[
+                :, : self.max_text_len, : self.max_text_len
+            ]
+            position_ids = position_ids[:, : self.max_text_len]
+            tokenized["input_ids"] = tokenized["input_ids"][:, : self.max_text_len]
+            tokenized["attention_mask"] = tokenized["attention_mask"][:, : self.max_text_len]
+            tokenized["token_type_ids"] = tokenized["token_type_ids"][:, : self.max_text_len]
+
+        # extract text embeddings
+        if self.sub_sentence_present:
+            tokenized_for_encoder = {k: v for k, v in tokenized.items() if k != "attention_mask"}
+            tokenized_for_encoder["attention_mask"] = text_self_attention_masks
+            tokenized_for_encoder["position_ids"] = position_ids
+        else:
+            # import ipdb; ipdb.set_trace()
+            tokenized_for_encoder = tokenized
+
+        bert_output = self.bert(**tokenized_for_encoder)  # bs, 195, 768
+
+        encoded_text = self.feat_map(bert_output["last_hidden_state"])  # bs, 195, d_model
+        text_token_mask = tokenized.attention_mask.bool()  # bs, 195
+        # text_token_mask: True for nomask, False for mask
+        # text_self_attention_masks: True for nomask, False for mask
+
+        if encoded_text.shape[1] > self.max_text_len:
+            encoded_text = encoded_text[:, : self.max_text_len, :]
+            text_token_mask = text_token_mask[:, : self.max_text_len]
+            position_ids = position_ids[:, : self.max_text_len]
+            text_self_attention_masks = text_self_attention_masks[
+                :, : self.max_text_len, : self.max_text_len
+            ]
+
+        text_dict = {
+            "encoded_text": encoded_text,  # bs, 195, d_model
+            "text_token_mask": text_token_mask,  # bs, 195
+            "position_ids": position_ids,  # bs, 195
+            "text_self_attention_masks": text_self_attention_masks,  # bs, 195,195
+        }
+
+        srcs = []
+        masks = []
+        for l, feat in enumerate(features):
+            src, mask = feat.decompose()
+            srcs.append(self.input_proj[l](src))
+            masks.append(mask)
+            assert mask is not None
+        if self.num_feature_levels > len(srcs):
+            _len_srcs = len(srcs)
+            for l in range(_len_srcs, self.num_feature_levels):
+                if l == _len_srcs:
+                    src = self.input_proj[l](features[-1].tensors)
+                else:
+                    src = self.input_proj[l](srcs[-1])
+                m = torch.zeros((src.shape[0], src.shape[-2], src.shape[-1]), dtype=torch.bool, device=device)
+                mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
+                pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
+                srcs.append(src)
+                masks.append(mask)
+                poss.append(pos_l)
+
+        input_query_bbox = input_query_label = attn_mask = dn_meta = None
+        hs, reference, hs_enc, ref_enc, init_box_proposal = self.transformer(
+            srcs, masks, input_query_bbox, poss, input_query_label, attn_mask, text_dict
+        )
+
+        # deformable-detr-like anchor update
+        outputs_coord_list = []
+        for dec_lid, (layer_ref_sig, layer_bbox_embed, layer_hs) in enumerate(
+            zip(reference[:-1], self.bbox_embed, hs)
+        ):
+            layer_delta_unsig = layer_bbox_embed(layer_hs)
+            layer_outputs_unsig = layer_delta_unsig + inverse_sigmoid(layer_ref_sig)
+            layer_outputs_unsig = layer_outputs_unsig.sigmoid()
+            outputs_coord_list.append(layer_outputs_unsig)
+        outputs_coord_list = torch.stack(outputs_coord_list)
+
+        # output
+        outputs_class = torch.stack(
+            [
+                layer_cls_embed(layer_hs, text_dict)
+                for layer_cls_embed, layer_hs in zip(self.class_embed, hs)
+            ]
+        )
+        out = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord_list[-1]}
+
+        return out
+
+    def forward(self, samples: NestedTensor, targets: List = None, device = None, **kw):
         """The forward expects a NestedTensor, which consists of:
            - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
            - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -230,9 +387,12 @@ class GroundingDINO(nn.Module):
             captions = [t["caption"] for t in targets]
         len(captions)
 
+        if device is None:
+            device = samples.device
+
         # encoder texts
         tokenized = self.tokenizer(captions, padding="longest", return_tensors="pt").to(
-            samples.device
+            device
         )
         (
             text_self_attention_masks,
